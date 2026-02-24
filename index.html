@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand Sphere</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { width:100vw; height:100vh; overflow:hidden; background:#000; font-family:'Share Tech Mono',monospace; }
+        .container { position:relative; width:100%; height:100%; }
+        #webcam { position:absolute; width:100%; height:100%; object-fit:cover; transform:scaleX(-1); opacity:0; }
+        #canvas { position:absolute; top:0; left:0; width:100%; height:100%; transform:scaleX(-1); pointer-events:none; z-index:3; }
+        #three-canvas { position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:5; }
+        #hud { position:absolute; top:20px; left:20px; z-index:10; color:#0ff; font-size:12px; line-height:2; text-shadow:0 0 8px #0ff; }
+        .label { color:#555; } .val { color:#0ff; }
+        #legend { position:absolute; bottom:20px; left:20px; z-index:10; color:#444; font-size:11px; line-height:2.2; }
+        #legend span { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:8px; vertical-align:middle; }
+        .rc { background:#0ff; box-shadow:0 0 6px #0ff; }
+        .lc { background:#0f0; box-shadow:0 0 6px #0f0; }
+        #grab-ring { position:absolute; border-radius:50%; border:2px solid #0f0; pointer-events:none; z-index:8; transform:translate(-50%,-50%); transition:opacity 0.15s, border-color 0.1s; opacity:0; }
+        #burst-flash { position:absolute; inset:0; pointer-events:none; z-index:20; background:radial-gradient(circle at center, rgba(255,255,255,0.25) 0%, transparent 70%); opacity:0; transition:opacity 0.05s; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="canvas"></canvas>
+    <div id="three-canvas"></div>
+    <div id="grab-ring"></div>
+    <div id="burst-flash"></div>
+    <div id="hud">
+        <div><span class="label">STATUS  </span><span class="val" id="st">loading...</span></div>
+        <div><span class="label">SIZE    </span><span class="val" id="sz">–</span></div>
+        <div><span class="label">GESTURE </span><span class="val" id="gs">–</span></div>
+    </div>
+    <div id="legend">
+        <div><span class="rc"></span> RIGHT — pinch to resize</div>
+        <div><span class="lc"></span> LEFT  — hover + fist to grab &amp; rotate</div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const videoEl  = document.getElementById('webcam');
+    const canvasEl = document.getElementById('canvas');
+    const ctx      = canvasEl.getContext('2d');
+    const threeDiv = document.getElementById('three-canvas');
+    const flash    = document.getElementById('burst-flash');
+    const ring     = document.getElementById('grab-ring');
+    const stEl=document.getElementById('st'), szEl=document.getElementById('sz'), gsEl=document.getElementById('gs');
+
+    let scene, cam3, renderer, sphereGroup, solidMesh, wireMesh;
+    const NEON=[0xff00ff,0x00ffff,0x39ff14,0xff3300,0xff0099,0xffff00,0xff6600,0x00ff88];
+    let currentColor=0x00ffff;
+
+    function initThree() {
+        scene=new THREE.Scene();
+        cam3=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,1000);
+        cam3.position.z=6;
+        renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+        renderer.setSize(innerWidth,innerHeight);
+        renderer.setClearColor(0x000000,0);
+        threeDiv.appendChild(renderer.domElement);
+
+        const geo=new THREE.SphereGeometry(2,48,48);
+        solidMesh=new THREE.Mesh(geo,new THREE.MeshPhongMaterial({
+            color:currentColor,emissive:currentColor,emissiveIntensity:0.3,
+            transparent:true,opacity:0.45,shininess:120
+        }));
+        wireMesh=new THREE.Mesh(geo,new THREE.MeshBasicMaterial({
+            color:0xffffff,wireframe:true,transparent:true,opacity:0.2
+        }));
+        sphereGroup=new THREE.Group();
+        sphereGroup.add(solidMesh); sphereGroup.add(wireMesh);
+        scene.add(sphereGroup);
+        scene.add(new THREE.AmbientLight(0xffffff,0.6));
+        const pt=new THREE.PointLight(0xffffff,1.5,50);
+        pt.position.set(4,4,4); scene.add(pt);
+        animate();
+    }
+
+    // ── Rotation via quaternion — no gimbal lock, no axis conflicts ──
+    const quat      = new THREE.Quaternion();  // current orientation
+    const quatDelta = new THREE.Quaternion();  // delta per frame
+    const axisX     = new THREE.Vector3(1,0,0);
+    const axisY     = new THREE.Vector3(0,1,0);
+
+    // Velocity (radians per frame)
+    let velX = 0, velY = 0;
+    const IDLE_SPEED  = 0.004;   // idle rotation speed
+    const INERTIA     = 0.88;    // inertia decay after release
+    const GRAB_SPEED  = 0.005;   // lower = slower rotation when grabbing
+    const DEAD_ZONE   = 2.5;     // pixels — ignore micro-jitter below this
+
+    // EMA smoothing for palm position
+    const EMA         = 0.18;    // 0.0–1.0: lower = smoother but more lag
+    let smoothPcX = null, smoothPcY = null;
+
+    let sphereSize=1.0, targetSize=1.0;
+    let isGrabbing=false;
+    let grabLastX=null, grabLastY=null;
+
+    // Apply angular velocity to quaternion
+    function applyRotation(dX, dY) {
+        if (Math.abs(dX)<1e-6 && Math.abs(dY)<1e-6) return;
+        quatDelta.setFromAxisAngle(axisY, dY);
+        quat.premultiply(quatDelta);
+        quatDelta.setFromAxisAngle(axisX, dX);
+        quat.premultiply(quatDelta);
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+
+        sphereSize+=(targetSize-sphereSize)*0.12;
+        sphereGroup.scale.setScalar(sphereSize);
+
+        if (isGrabbing) {
+            // While grabbed: velocity applied in onResults, no extra here
+        } else {
+            // Inertia decay + idle spin
+            velY = velY*INERTIA + (Math.abs(velY)<0.0005 ? IDLE_SPEED : 0);
+            velX *= INERTIA;
+            applyRotation(velX, velY);
+        }
+
+        sphereGroup.quaternion.copy(quat);
+
+        const t=Date.now()*0.001;
+        solidMesh.material.opacity=0.38+0.08*Math.sin(t*2);
+        solidMesh.material.emissiveIntensity=0.2+0.15*Math.sin(t*1.5);
+
+        renderer.render(scene,cam3);
+        szEl.textContent=sphereSize.toFixed(2);
+    }
+
+    window.addEventListener('resize',()=>{
+        canvasEl.width=innerWidth; canvasEl.height=innerHeight;
+        renderer.setSize(innerWidth,innerHeight);
+        cam3.aspect=innerWidth/innerHeight; cam3.updateProjectionMatrix();
+    });
+    canvasEl.width=innerWidth; canvasEl.height=innerHeight;
+
+    function dist3(a,b){return Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2+(a.z-b.z)**2);}
+
+    // Palm center: average of 0,5,9,13,17
+    function palmCenter(lm){
+        const pts=[0,5,9,13,17];
+        let sx=0,sy=0;
+        pts.forEach(i=>{sx+=lm[i].x;sy+=lm[i].y;});
+        return {x:(1-sx/5)*innerWidth, y:sy/5*innerHeight};
+    }
+
+    function sphereScreenRadius(){
+        const halfH=Math.tan(THREE.MathUtils.degToRad(30))*cam3.position.z;
+        return (2*sphereSize/halfH)*(innerHeight/2);
+    }
+
+    function isNearSphere(lm){
+        const p=palmCenter(lm), sr=sphereScreenRadius()*1.15;
+        return Math.hypot(p.x-innerWidth/2, p.y-innerHeight/2)<sr;
+    }
+
+    // Fist: fingertips close to their own MCP bases
+    function isFist(lm){
+        const tips=[8,12,16,20], mcps=[5,9,13,17];
+        return tips.every((t,i)=>dist3(lm[t],lm[mcps[i]])<0.13);
+    }
+
+    const CONN=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],[0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]];
+
+    function drawHand(lm,color){
+        ctx.strokeStyle=color; ctx.lineWidth=2;
+        CONN.forEach(([a,b])=>{
+            ctx.beginPath();
+            ctx.moveTo(lm[a].x*canvasEl.width,lm[a].y*canvasEl.height);
+            ctx.lineTo(lm[b].x*canvasEl.width,lm[b].y*canvasEl.height);
+            ctx.stroke();
+        });
+        lm.forEach((p,i)=>{
+            ctx.fillStyle=(i===4||i===8)?'#ff4444':color;
+            ctx.beginPath();
+            ctx.arc(p.x*canvasEl.width,p.y*canvasEl.height,i===4||i===8?6:3,0,Math.PI*2);
+            ctx.fill();
+        });
+        // Palm center ring
+        const pc=palmCenter(lm);
+        const pcCx=(lm[0].x+lm[5].x+lm[9].x+lm[13].x+lm[17].x)/5*canvasEl.width;
+        const pcCy=(lm[0].y+lm[5].y+lm[9].y+lm[13].y+lm[17].y)/5*canvasEl.height;
+        ctx.strokeStyle=color; ctx.lineWidth=1;
+        ctx.beginPath(); ctx.arc(pcCx,pcCy,10,0,Math.PI*2); ctx.stroke();
+    }
+
+    function showRing(x,y,r,color){
+        const s=r*2;
+        ring.style.left=x+'px'; ring.style.top=y+'px';
+        ring.style.width=s+'px'; ring.style.height=s+'px';
+        ring.style.borderColor=color;
+        ring.style.boxShadow=`0 0 16px ${color}, inset 0 0 10px ${color}44`;
+        ring.style.opacity='1';
+    }
+    function hideRing(){ring.style.opacity='0';}
+
+    function onResults(res){
+        ctx.clearRect(0,0,canvasEl.width,canvasEl.height);
+
+        if(!res.multiHandLandmarks||res.multiHandLandmarks.length===0){
+            stEl.textContent='no hands'; gsEl.textContent='–';
+            isGrabbing=false; grabLastX=grabLastY=null;
+            smoothPcX=null; smoothPcY=null;
+            hideRing(); return;
+        }
+        stEl.textContent=res.multiHandLandmarks.length===1?'1 hand':'2 hands';
+
+        let leftSeen=false;
+
+        for(let i=0;i<res.multiHandLandmarks.length;i++){
+            const lm=res.multiHandLandmarks[i];
+            const isLeft=res.multiHandedness[i].label==='Left';
+            drawHand(lm,isLeft?'#00ff44':'#00ffff');
+
+            if(!isLeft){
+                // RIGHT: pinch → size
+                const pinch=dist3(lm[4],lm[8]);
+                targetSize=Math.max(0.15,Math.min(2.4, 0.15+(Math.max(0,pinch-0.04)/0.22)*2.25));
+                if(!leftSeen) gsEl.textContent='PINCH → SIZE';
+
+            } else {
+                leftSeen=true;
+                const near=isNearSphere(lm);
+                const fist=isFist(lm);
+                const pc=palmCenter(lm);
+                const sr=sphereScreenRadius();
+
+                // EMA smooth the palm position
+                if(smoothPcX===null){ smoothPcX=pc.x; smoothPcY=pc.y; }
+                smoothPcX += EMA*(pc.x-smoothPcX);
+                smoothPcY += EMA*(pc.y-smoothPcY);
+                const spc = {x:smoothPcX, y:smoothPcY};
+
+                if(fist && (near || isGrabbing)){
+                    // ── GRAB: active ──
+                    if(!isGrabbing){
+                        isGrabbing=true;
+                        grabLastX=spc.x; grabLastY=spc.y;
+                        velX=0; velY=0;
+                        flash.style.opacity='0.2';
+                        setTimeout(()=>{flash.style.opacity='0';},60);
+                    }
+
+                    if(grabLastX!==null){
+                        const dx=spc.x-grabLastX;
+                        const dy=spc.y-grabLastY;
+                        // Dead zone — ignore tiny jitter
+                        if(Math.abs(dx)>DEAD_ZONE || Math.abs(dy)>DEAD_ZONE){
+                            velY=dx*GRAB_SPEED;
+                            velX=dy*GRAB_SPEED;
+                            applyRotation(velX, velY);
+                        }
+                    }
+                    grabLastX=spc.x; grabLastY=spc.y;
+
+                    showRing(spc.x,spc.y,sr*0.5,'#00ff44');
+                    gsEl.textContent='✊ GRABBED — drag any direction';
+
+                } else if(!fist){
+                    // Released
+                    if(isGrabbing){
+                        isGrabbing=false; grabLastX=grabLastY=null;
+                        smoothPcX=null; smoothPcY=null;
+                        // velX/velY keep their last values → inertia in animate()
+                    }
+                    if(near){
+                        showRing(spc.x,spc.y,sr*0.5,'#ffff00');
+                        gsEl.textContent='✋ HOVER — fist to grab';
+                    } else {
+                        hideRing();
+                        gsEl.textContent='move left hand to sphere';
+                    }
+                }
+            }
+        }
+
+        if(!leftSeen){
+            isGrabbing=false; grabLastX=grabLastY=null;
+            hideRing();
+        }
+    }
+
+    async function start(){
+        stEl.textContent='starting camera...';
+        const stream=await navigator.mediaDevices.getUserMedia({
+            video:{width:{ideal:1280},height:{ideal:720},facingMode:'user'}
+        });
+        videoEl.srcObject=stream;
+        await new Promise(r=>videoEl.onloadedmetadata=r);
+        initThree();
+        const handsMP=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+        handsMP.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:0.6,minTrackingConfidence:0.6});
+        await handsMP.initialize();
+        handsMP.onResults(onResults);
+        const camera=new Camera(videoEl,{
+            onFrame:async()=>{await handsMP.send({image:videoEl});},
+            width:1280,height:720
+        });
+        camera.start();
+        stEl.textContent='ready';
+    }
+
+    start().catch(e=>{stEl.textContent='error: '+e.message;console.error(e);});
+});
+</script>
+</body>
+</html>
