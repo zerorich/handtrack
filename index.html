@@ -53,9 +53,79 @@ document.addEventListener('DOMContentLoaded', () => {
     const ring     = document.getElementById('grab-ring');
     const stEl=document.getElementById('st'), szEl=document.getElementById('sz'), gsEl=document.getElementById('gs');
 
-    let scene, cam3, renderer, sphereGroup, solidMesh, wireMesh;
+    let scene, cam3, renderer, sphereGroup, particleSystem;
     const NEON=[0xff00ff,0x00ffff,0x39ff14,0xff3300,0xff0099,0xffff00,0xff6600,0x00ff88];
     let currentColor=0x00ffff;
+
+    // Формы для облака партиклов
+    const SHAPES = ['sphere','cube','torus','disc'];
+    let shapeIndex = 0;
+    const BASE_RADIUS = 2.3;
+    let particleAttr = null;
+    let particleTarget = null;
+    let shapeCooldown = 0; // чтобы жест не переключал форму каждый кадр
+
+    function fillShapePositions(shape, arr){
+        const n = arr.length / 3;
+        if(shape === 'sphere'){
+            for (let i = 0; i < n; i++) {
+                const u = Math.random();
+                const v = Math.random();
+                const theta = 2 * Math.PI * u;
+                const phi = Math.acos(2 * v - 1);
+                const x = BASE_RADIUS * Math.sin(phi) * Math.cos(theta);
+                const y = BASE_RADIUS * Math.sin(phi) * Math.sin(theta);
+                const z = BASE_RADIUS * Math.cos(phi);
+                const idx = i * 3;
+                arr[idx]     = x;
+                arr[idx + 1] = y;
+                arr[idx + 2] = z;
+            }
+        } else if (shape === 'cube'){
+            const r = BASE_RADIUS * 0.9;
+            for (let i = 0; i < n; i++) {
+                const face = Math.floor(Math.random()*3); // 0:x,1:y,2:z
+                const sign = Math.random() < 0.5 ? -1 : 1;
+                let x = (Math.random()*2-1)*r;
+                let y = (Math.random()*2-1)*r;
+                let z = (Math.random()*2-1)*r;
+                if(face===0) x = sign*r;
+                else if(face===1) y = sign*r;
+                else z = sign*r;
+                const idx = i * 3;
+                arr[idx]     = x;
+                arr[idx + 1] = y;
+                arr[idx + 2] = z;
+            }
+        } else if (shape === 'torus'){
+            const R = BASE_RADIUS * 0.85;
+            const r = BASE_RADIUS * 0.35;
+            for (let i = 0; i < n; i++) {
+                const u = Math.random()*2*Math.PI;
+                const v = Math.random()*2*Math.PI;
+                const cx = (R + r*Math.cos(v)) * Math.cos(u);
+                const cy = (R + r*Math.cos(v)) * Math.sin(u);
+                const cz = r * Math.sin(v);
+                const idx = i * 3;
+                arr[idx]     = cx;
+                arr[idx + 1] = cz;
+                arr[idx + 2] = cy;
+            }
+        } else if (shape === 'disc'){
+            const r = BASE_RADIUS * 1.15;
+            for (let i = 0; i < n; i++) {
+                const ang = Math.random()*2*Math.PI;
+                const rad = r * Math.sqrt(Math.random());
+                const x = rad*Math.cos(ang);
+                const z = rad*Math.sin(ang);
+                const y = (Math.random()*2-1)*0.25; // тонкий «слой»
+                const idx = i * 3;
+                arr[idx]     = x;
+                arr[idx + 1] = y;
+                arr[idx + 2] = z;
+            }
+        }
+    }
 
     function initThree() {
         scene=new THREE.Scene();
@@ -66,17 +136,28 @@ document.addEventListener('DOMContentLoaded', () => {
         renderer.setClearColor(0x000000,0);
         threeDiv.appendChild(renderer.domElement);
 
-        const geo=new THREE.SphereGeometry(2,48,48);
-        solidMesh=new THREE.Mesh(geo,new THREE.MeshPhongMaterial({
-            color:currentColor,emissive:currentColor,emissiveIntensity:0.3,
-            transparent:true,opacity:0.45,shininess:120
-        }));
-        wireMesh=new THREE.Mesh(geo,new THREE.MeshBasicMaterial({
-            color:0xffffff,wireframe:true,transparent:true,opacity:0.2
-        }));
         sphereGroup=new THREE.Group();
-        sphereGroup.add(solidMesh); sphereGroup.add(wireMesh);
         scene.add(sphereGroup);
+
+        // Dense particle cloud (only particles)
+        const particleCount = 6000;
+        const positions = new Float32Array(particleCount * 3);
+        fillShapePositions('sphere', positions);
+        const pGeo = new THREE.BufferGeometry();
+        particleAttr = new THREE.BufferAttribute(positions, 3);
+        pGeo.setAttribute('position', particleAttr);
+        // целевая форма для морфа
+        particleTarget = positions.slice();
+        const pMat = new THREE.PointsMaterial({
+            color: currentColor,
+            size: 0.03,
+            transparent: true,
+            opacity: 0.95,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+        });
+        particleSystem = new THREE.Points(pGeo, pMat);
+        sphereGroup.add(particleSystem);
         scene.add(new THREE.AmbientLight(0xffffff,0.6));
         const pt=new THREE.PointLight(0xffffff,1.5,50);
         pt.position.set(4,4,4); scene.add(pt);
@@ -103,6 +184,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let sphereSize=1.0, targetSize=1.0;
     let isGrabbing=false;
     let grabLastX=null, grabLastY=null;
+
+    // Smoothed pinch distance for right-hand sphere scaling
+    let smoothPinch = null;
 
     // Apply angular velocity to quaternion
     function applyRotation(dX, dY) {
@@ -131,8 +215,25 @@ document.addEventListener('DOMContentLoaded', () => {
         sphereGroup.quaternion.copy(quat);
 
         const t=Date.now()*0.001;
-        solidMesh.material.opacity=0.38+0.08*Math.sin(t*2);
-        solidMesh.material.emissiveIntensity=0.2+0.15*Math.sin(t*1.5);
+
+        // Морфинг между формами + анимация
+        if (particleSystem && particleAttr && particleTarget) {
+            const arr = particleAttr.array;
+            const tgt = particleTarget;
+            const len = arr.length;
+            for (let i = 0; i < len; i++) {
+                arr[i] += (tgt[i] - arr[i]) * 0.08;
+            }
+            particleAttr.needsUpdate = true;
+
+            particleSystem.rotation.y += 0.002;
+            particleSystem.rotation.x += 0.001;
+            const pulseSize = 0.04 + 0.015 * Math.sin(t * 3.0);
+            particleSystem.material.size = pulseSize;
+            particleSystem.material.color.setHex(currentColor);
+        }
+
+        if (shapeCooldown > 0) shapeCooldown--;
 
         renderer.render(scene,cam3);
         szEl.textContent=sphereSize.toFixed(2);
@@ -212,11 +313,15 @@ document.addEventListener('DOMContentLoaded', () => {
             stEl.textContent='no hands'; gsEl.textContent='–';
             isGrabbing=false; grabLastX=grabLastY=null;
             smoothPcX=null; smoothPcY=null;
+            smoothPinch=null;
             hideRing(); return;
         }
         stEl.textContent=res.multiHandLandmarks.length===1?'1 hand':'2 hands';
 
         let leftSeen=false;
+        let rightSeen=false;
+        let leftFistNear=false;
+        let rightFistNear=false;
 
         for(let i=0;i<res.multiHandLandmarks.length;i++){
             const lm=res.multiHandLandmarks[i];
@@ -224,15 +329,24 @@ document.addEventListener('DOMContentLoaded', () => {
             drawHand(lm,isLeft?'#00ff44':'#00ffff');
 
             if(!isLeft){
-                // RIGHT: pinch → size
+                rightSeen=true;
+                const nearR = isNearSphere(lm);
+                const fistR = isFist(lm);
+                if(fistR && nearR) rightFistNear = true;
+
+                // RIGHT: pinch → size (smoothed)
                 const pinch=dist3(lm[4],lm[8]);
-                targetSize=Math.max(0.15,Math.min(2.4, 0.15+(Math.max(0,pinch-0.04)/0.22)*2.25));
+                if(smoothPinch===null){ smoothPinch=pinch; }
+                smoothPinch += 0.25*(pinch-smoothPinch);
+                const p=smoothPinch;
+                targetSize=Math.max(0.15,Math.min(2.4, 0.15+(Math.max(0,p-0.04)/0.22)*2.25));
                 if(!leftSeen) gsEl.textContent='PINCH → SIZE';
 
             } else {
                 leftSeen=true;
                 const near=isNearSphere(lm);
                 const fist=isFist(lm);
+                if(fist && near) leftFistNear = true;
                 const pc=palmCenter(lm);
                 const sr=sphereScreenRadius();
 
@@ -285,9 +399,22 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
+        // Новый жест смены формы:
+        // две руки, оба кулака рядом с облаком → переключить форму
+        if(leftFistNear && rightFistNear && shapeCooldown===0 && particleTarget){
+            shapeIndex = (shapeIndex + 1) % SHAPES.length;
+            const shapeName = SHAPES[shapeIndex];
+            fillShapePositions(shapeName, particleTarget);
+            shapeCooldown = 25;
+            gsEl.textContent='BOTH FISTS → CHANGE SHAPE';
+        }
+
         if(!leftSeen){
             isGrabbing=false; grabLastX=grabLastY=null;
             hideRing();
+        }
+        if(!rightSeen){
+            smoothPinch=null;
         }
     }
 
